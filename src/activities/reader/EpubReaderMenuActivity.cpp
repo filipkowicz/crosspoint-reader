@@ -3,6 +3,8 @@
 #include <GfxRenderer.h>
 #include <I18n.h>
 
+#include <cstdio>
+
 #include "MappedInputManager.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -10,14 +12,18 @@
 EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                const std::string& title, const int currentPage, const int totalPages,
                                                const int bookProgressPercent, const uint8_t currentOrientation,
-                                               const bool hasFootnotes, const bool hasBookmarks)
+                                               const bool hasFootnotes, const bool hasBookmarks,
+                                               const uint32_t currentKindleLocation,
+                                               const uint32_t kindleTotalLocations)
     : Activity("EpubReaderMenu", renderer, mappedInput),
       menuItems(buildMenuItems(hasFootnotes, hasBookmarks)),
       title(title),
       pendingOrientation(currentOrientation),
       currentPage(currentPage),
       totalPages(totalPages),
-      bookProgressPercent(bookProgressPercent) {}
+      bookProgressPercent(bookProgressPercent),
+      currentKindleLocation(currentKindleLocation),
+      kindleTotalLocations(kindleTotalLocations) {}
 
 std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuItems(bool hasFootnotes,
                                                                                      bool hasBookmarks) {
@@ -34,6 +40,7 @@ std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuI
   items.push_back({MenuAction::ROTATE_SCREEN, StrId::STR_ORIENTATION});
   items.push_back({MenuAction::AUTO_PAGE_TURN, StrId::STR_AUTO_TURN_PAGES_PER_MIN});
   items.push_back({MenuAction::GO_TO_PERCENT, StrId::STR_GO_TO_PERCENT});
+  items.push_back({MenuAction::KINDLE_LOCATION, StrId::STR_KINDLE_LOCATION});
   items.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
   items.push_back({MenuAction::DISPLAY_QR, StrId::STR_DISPLAY_QR});
   items.push_back({MenuAction::GO_HOME, StrId::STR_GO_HOME_BUTTON});
@@ -121,12 +128,17 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
         const auto value = menuItems[index].action;
         if (value == MenuAction::ROTATE_SCREEN) {
           // Render current orientation value on the right edge of the content area.
-          return I18N.get(orientationLabels[pendingOrientation]);
+          return std::string(I18N.get(orientationLabels[pendingOrientation]));
         } else if (value == MenuAction::AUTO_PAGE_TURN) {
           // Render current page turn value on the right edge of the content area.
-          return pageTurnLabels[selectedPageTurnOption];
+          return std::string(pageTurnLabels[selectedPageTurnOption]);
+        } else if (value == MenuAction::KINDLE_LOCATION && kindleTotalLocations > 0 && currentKindleLocation > 0) {
+          char buf[32];
+          snprintf(buf, sizeof(buf), tr(STR_KINDLE_LOCATION_FORMAT), static_cast<unsigned int>(currentKindleLocation),
+                   static_cast<unsigned int>(kindleTotalLocations));
+          return std::string(buf);
         } else {
-          return "";
+          return std::string();
         }
       },
       true);

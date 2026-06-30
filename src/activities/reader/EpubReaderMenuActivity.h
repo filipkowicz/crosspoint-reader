@@ -2,6 +2,7 @@
 #include <Epub.h>
 #include <I18n.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -23,12 +24,14 @@ class EpubReaderMenuActivity final : public Activity {
     DISPLAY_QR,
     GO_HOME,
     SYNC,
-    DELETE_CACHE
+    DELETE_CACHE,
+    KINDLE_LOCATION
   };
 
   explicit EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& title,
                                   const int currentPage, const int totalPages, const int bookProgressPercent,
-                                  const uint8_t currentOrientation, const bool hasFootnotes, bool hasBookmarks);
+                                  const uint8_t currentOrientation, const bool hasFootnotes, bool hasBookmarks,
+                                  uint32_t currentKindleLocation, uint32_t kindleTotalLocations);
 
   void onEnter() override;
   void onExit() override;
@@ -58,4 +61,6 @@ class EpubReaderMenuActivity final : public Activity {
   int currentPage = 0;
   int totalPages = 0;
   int bookProgressPercent = 0;
+  uint32_t currentKindleLocation = 0;
+  uint32_t kindleTotalLocations = 0;
 };

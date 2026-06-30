@@ -13,6 +13,7 @@
 #include <esp_system.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -26,12 +27,14 @@
 #include "EpubReaderPercentSelectionActivity.h"
 #include "EpubReaderUtils.h"
 #include "KOReaderCredentialStore.h"
+#include "KindleLocation.h"
 #include "KOReaderSyncActivity.h"
 #include "MappedInputManager.h"
 #include "ProgressMapper.h"
 #include "QrDisplayActivity.h"
 #include "ReaderUtils.h"
 #include "RecentBooksStore.h"
+#include "activities/util/KeyboardEntryActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/BookmarkUtil.h"
@@ -43,6 +46,8 @@ namespace {
 constexpr int PAGE_TURN_RATES[] = {1, 1, 3, 6, 12};
 constexpr size_t initialBookmarkCacheCapacity = 16;
 constexpr float bookmarkProgressEpsilon = 0.0001f;
+constexpr char KINDLE_LOCATION_FILENAME[] = "/kindle_location.bin";
+constexpr uint8_t KINDLE_LOCATION_VERSION = 1;
 
 int clampPercent(int percent) {
   if (percent < 0) {
@@ -93,6 +98,39 @@ bool bookmarkMatchesProgress(const BookmarkEntry& bookmark, const int spineIndex
   const float bookmarkProgress = std::clamp(bookmark.percentage, 0.0f, 1.0f);
   return bookmarkProgress + bookmarkProgressEpsilon >= pageRange.start &&
          bookmarkProgress - bookmarkProgressEpsilon <= pageRange.end;
+}
+
+uint32_t readLe32(const uint8_t* data) {
+  return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8) |
+         (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
+}
+
+void writeLe32(uint8_t* data, const uint32_t value) {
+  data[0] = static_cast<uint8_t>(value & 0xFF);
+  data[1] = static_cast<uint8_t>((value >> 8) & 0xFF);
+  data[2] = static_cast<uint8_t>((value >> 16) & 0xFF);
+  data[3] = static_cast<uint8_t>((value >> 24) & 0xFF);
+}
+
+bool parseUnsignedInput(const std::string& text, uint32_t& value) {
+  value = 0;
+  bool hasDigit = false;
+  for (const char ch : text) {
+    if (ch == ' ') {
+      continue;
+    }
+    if (ch < '0' || ch > '9') {
+      return false;
+    }
+    hasDigit = true;
+    const uint32_t digit = static_cast<uint32_t>(ch - '0');
+    if (value > (KindleLocation::kMaxTotalLocations - digit) / 10) {
+      value = KindleLocation::kMaxTotalLocations + 1;
+      return true;
+    }
+    value = value * 10 + digit;
+  }
+  return hasDigit;
 }
 
 // Pick a non-colliding destination path inside /Read/ for a finished book.
@@ -160,6 +198,7 @@ void EpubReaderActivity::onEnter() {
   ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
 
   epub->setupCacheDir();
+  loadKindleLocationTotal();
 
   HalFile f;
   if (Storage.openFileForRead("ERS", epub->getCachePath() + "/progress.bin", f)) {
@@ -315,7 +354,8 @@ void EpubReaderActivity::loop() {
       const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
       startActivityForResult(std::make_unique<EpubReaderMenuActivity>(
                                  renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent,
-                                 SETTINGS.orientation, !currentPageFootnotes.empty(), !cachedBookmarks.empty()),
+                                 SETTINGS.orientation, !currentPageFootnotes.empty(), !cachedBookmarks.empty(),
+                                 getCurrentKindleLocation(), kindleTotalLocations),
                              [this](const ActivityResult& result) {
                                // Always apply orientation change even if the menu was cancelled
                                const auto& menu = std::get<MenuResult>(result.data);
@@ -469,9 +509,7 @@ void EpubReaderActivity::loop() {
   }
 }
 
-// Translate an absolute percent into a spine index plus a normalized position
-// within that spine so we can jump after the section is loaded.
-void EpubReaderActivity::jumpToPercent(int percent) {
+void EpubReaderActivity::jumpToProgress(float progress) {
   if (!epub) {
     return;
   }
@@ -481,14 +519,11 @@ void EpubReaderActivity::jumpToPercent(int percent) {
     return;
   }
 
-  // Normalize input to 0-100 to avoid invalid jumps.
-  percent = clampPercent(percent);
+  progress = std::clamp(progress, 0.0f, 1.0f);
 
-  // Convert percent into a byte-like absolute position across the spine sizes.
-  // Use an overflow-safe computation: (bookSize / 100) * percent + (bookSize % 100) * percent / 100
-  size_t targetSize =
-      (bookSize / 100) * static_cast<size_t>(percent) + (bookSize % 100) * static_cast<size_t>(percent) / 100;
-  if (percent >= 100) {
+  // Convert normalized progress into a byte-like absolute position across the spine sizes.
+  size_t targetSize = static_cast<size_t>(static_cast<double>(bookSize) * static_cast<double>(progress));
+  if (progress >= 1.0f) {
     // Ensure the final percent lands inside the last spine item.
     targetSize = bookSize - 1;
   }
@@ -530,6 +565,140 @@ void EpubReaderActivity::jumpToPercent(int percent) {
     pendingPercentJump = true;
     section.reset();
   }
+}
+
+// Translate an absolute percent into a spine index plus a normalized position
+// within that spine so we can jump after the section is loaded.
+void EpubReaderActivity::jumpToPercent(int percent) {
+  percent = clampPercent(percent);
+  jumpToProgress(static_cast<float>(percent) / 100.0f);
+}
+
+void EpubReaderActivity::loadKindleLocationTotal() {
+  kindleTotalLocations = 0;
+  if (!epub) {
+    return;
+  }
+
+  HalFile f;
+  const std::string path = epub->getCachePath() + KINDLE_LOCATION_FILENAME;
+  if (!Storage.exists(path.c_str())) {
+    return;
+  }
+  if (!Storage.openFileForRead("KLC", path, f)) {
+    return;
+  }
+
+  uint8_t data[8] = {};
+  if (f.read(data, sizeof(data)) != static_cast<int>(sizeof(data))) {
+    return;
+  }
+
+  if (data[0] != 'K' || data[1] != 'L' || data[2] != 'C' || data[3] != KINDLE_LOCATION_VERSION) {
+    return;
+  }
+
+  const uint32_t total = readLe32(data + 4);
+  if (KindleLocation::isValidTotal(total)) {
+    kindleTotalLocations = total;
+  }
+}
+
+bool EpubReaderActivity::saveKindleLocationTotal(const uint32_t total) {
+  if (!epub || !KindleLocation::isValidTotal(total)) {
+    return false;
+  }
+
+  uint8_t data[8] = {'K', 'L', 'C', KINDLE_LOCATION_VERSION, 0, 0, 0, 0};
+  writeLe32(data + 4, total);
+
+  const std::string finalPath = epub->getCachePath() + KINDLE_LOCATION_FILENAME;
+  const std::string tmpPath = finalPath + ".tmp";
+
+  {
+    HalFile f;
+    if (!Storage.openFileForWrite("KLC", tmpPath, f)) {
+      LOG_ERR("KLC", "Could not open Kindle location temp file: %s", tmpPath.c_str());
+      return false;
+    }
+    const size_t written = f.write(data, sizeof(data));
+    if (written != sizeof(data)) {
+      LOG_ERR("KLC", "Short write saving Kindle location total: %u/%u", static_cast<unsigned int>(written),
+              static_cast<unsigned int>(sizeof(data)));
+      return false;
+    }
+    f.flush();
+  }
+
+  Storage.remove(finalPath.c_str());
+  if (!Storage.rename(tmpPath.c_str(), finalPath.c_str())) {
+    LOG_ERR("KLC", "Failed to rename Kindle location temp file into place");
+    return false;
+  }
+  return true;
+}
+
+float EpubReaderActivity::getCurrentBookProgress() const {
+  if (!epub || !section || epub->getBookSize() == 0 || section->pageCount <= 0) {
+    return 0.0f;
+  }
+  const float chapterProgress = static_cast<float>(section->currentPage) / static_cast<float>(section->pageCount);
+  return epub->calculateProgress(currentSpineIndex, chapterProgress);
+}
+
+uint32_t EpubReaderActivity::getCurrentKindleLocation() const {
+  return KindleLocation::locationFromProgress(getCurrentBookProgress(), kindleTotalLocations);
+}
+
+void EpubReaderActivity::openKindleLocationFlow() {
+  if (!epub) {
+    return;
+  }
+
+  if (!KindleLocation::isValidTotal(kindleTotalLocations)) {
+    startActivityForResult(
+        std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_SET_KINDLE_TOTAL), "", 7),
+        [this](const ActivityResult& result) {
+          if (result.isCancelled) {
+            requestUpdate();
+            return;
+          }
+
+          const auto& text = std::get<KeyboardResult>(result.data).text;
+          uint32_t total = 0;
+          if (!parseUnsignedInput(text, total) || !KindleLocation::isValidTotal(total)) {
+            requestUpdate();
+            return;
+          }
+
+          kindleTotalLocations = total;
+          if (!saveKindleLocationTotal(total)) {
+            LOG_ERR("KLC", "Failed to persist Kindle total locations");
+          }
+          requestUpdate();
+        });
+    return;
+  }
+
+  const uint32_t currentLocation = getCurrentKindleLocation();
+  const std::string initialLocation = currentLocation > 0 ? std::to_string(currentLocation) : "";
+  startActivityForResult(
+      std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_GO_TO_KINDLE_LOCATION), initialLocation, 7),
+      [this](const ActivityResult& result) {
+        if (result.isCancelled) {
+          requestUpdate();
+          return;
+        }
+
+        const auto& text = std::get<KeyboardResult>(result.data).text;
+        uint32_t targetLocation = 0;
+        if (!parseUnsignedInput(text, targetLocation)) {
+          requestUpdate();
+          return;
+        }
+
+        jumpToProgress(KindleLocation::progressFromLocation(targetLocation, kindleTotalLocations));
+      });
 }
 
 void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action) {
@@ -595,6 +764,10 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
               jumpToPercent(std::get<PercentResult>(result.data).percent);
             }
           });
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::KINDLE_LOCATION: {
+      openKindleLocationFlow();
       break;
     }
     case EpubReaderMenuActivity::MenuAction::DISPLAY_QR: {
