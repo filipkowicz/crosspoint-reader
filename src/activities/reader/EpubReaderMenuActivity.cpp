@@ -9,6 +9,10 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
+namespace {
+constexpr int EDIT_KINDLE_TOTAL_HOLD_MS = 700;
+}
+
 EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                const std::string& title, const int currentPage, const int totalPages,
                                                const int bookProgressPercent, const uint8_t currentOrientation,
@@ -68,7 +72,27 @@ void EpubReaderMenuActivity::loop() {
     requestUpdate();
   });
 
+  if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+    confirmHeld = true;
+    confirmLongHandled = false;
+  }
+
+  if (confirmHeld && !confirmLongHandled && mappedInput.isPressed(MappedInputManager::Button::Confirm) &&
+      mappedInput.getHeldTime() >= EDIT_KINDLE_TOTAL_HOLD_MS &&
+      menuItems[selectedIndex].action == MenuAction::KINDLE_LOCATION) {
+    confirmLongHandled = true;
+    setResult(MenuResult{static_cast<int>(MenuAction::EDIT_KINDLE_TOTAL), pendingOrientation, selectedPageTurnOption});
+    finish();
+    return;
+  }
+
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    if (confirmHeld && confirmLongHandled) {
+      confirmHeld = false;
+      confirmLongHandled = false;
+      return;
+    }
+
     const auto selectedAction = menuItems[selectedIndex].action;
     if (selectedAction == MenuAction::ROTATE_SCREEN) {
       // Cycle orientation preview locally; actual rotation happens on menu exit.
@@ -85,6 +109,8 @@ void EpubReaderMenuActivity::loop() {
 
     setResult(MenuResult{static_cast<int>(selectedAction), pendingOrientation, selectedPageTurnOption});
     finish();
+    confirmHeld = false;
+    confirmLongHandled = false;
     return;
   } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     ActivityResult result;
@@ -119,7 +145,9 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
 
   const int contentTop =
       screen.y + metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing;
-  const int contentHeight = screen.height - contentTop - metrics.verticalSpacing;
+  const bool kindleLocationSelected = menuItems[selectedIndex].action == MenuAction::KINDLE_LOCATION;
+  const int helpHeight = kindleLocationSelected && kindleTotalLocations > 0 ? metrics.listRowHeight : 0;
+  const int contentHeight = screen.height - contentTop - metrics.verticalSpacing - helpHeight;
 
   GUI.drawList(
       renderer, Rect{screen.x, contentTop, screen.width, contentHeight}, menuItems.size(), selectedIndex,
@@ -142,6 +170,11 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
         }
       },
       true);
+
+  if (helpHeight > 0) {
+    GUI.drawHelpText(renderer, Rect{screen.x, contentTop + contentHeight, screen.width, helpHeight},
+                     tr(STR_HOLD_SELECT_UPDATE_KINDLE_TOTAL));
+  }
 
   // Footer / Hints
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));

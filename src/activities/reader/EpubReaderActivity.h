@@ -67,6 +67,7 @@ class EpubReaderActivity final : public Activity {
   bool saveKindleLocationTotal(uint32_t total);
   float getCurrentBookProgress() const;
   uint32_t getCurrentKindleLocation() const;
+  void openKindleTotalFlow();
   void openKindleLocationFlow();
   void jumpToProgress(float progress);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.

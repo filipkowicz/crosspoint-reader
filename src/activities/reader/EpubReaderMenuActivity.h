@@ -25,7 +25,8 @@ class EpubReaderMenuActivity final : public Activity {
     GO_HOME,
     SYNC,
     DELETE_CACHE,
-    KINDLE_LOCATION
+    KINDLE_LOCATION,
+    EDIT_KINDLE_TOTAL
   };
 
   explicit EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& title,
@@ -50,6 +51,8 @@ class EpubReaderMenuActivity final : public Activity {
   const std::vector<MenuItem> menuItems;
 
   int selectedIndex = 0;
+  bool confirmHeld = false;
+  bool confirmLongHandled = false;
 
   ButtonNavigator buttonNavigator;
   std::string title = "Reader Menu";

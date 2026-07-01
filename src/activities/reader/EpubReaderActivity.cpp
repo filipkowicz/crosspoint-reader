@@ -650,33 +650,45 @@ uint32_t EpubReaderActivity::getCurrentKindleLocation() const {
   return KindleLocation::locationFromProgress(getCurrentBookProgress(), kindleTotalLocations);
 }
 
+void EpubReaderActivity::openKindleTotalFlow() {
+  if (!epub) {
+    return;
+  }
+
+  const std::string initialTotal =
+      KindleLocation::isValidTotal(kindleTotalLocations) ? std::to_string(kindleTotalLocations) : "";
+  const StrId titleId = KindleLocation::isValidTotal(kindleTotalLocations) ? StrId::STR_UPDATE_KINDLE_TOTAL
+                                                                           : StrId::STR_SET_KINDLE_TOTAL;
+  startActivityForResult(
+      std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, I18N.get(titleId), initialTotal, 7),
+      [this](const ActivityResult& result) {
+        if (result.isCancelled) {
+          requestUpdate();
+          return;
+        }
+
+        const auto& text = std::get<KeyboardResult>(result.data).text;
+        uint32_t total = 0;
+        if (!parseUnsignedInput(text, total) || !KindleLocation::isValidTotal(total)) {
+          requestUpdate();
+          return;
+        }
+
+        kindleTotalLocations = total;
+        if (!saveKindleLocationTotal(total)) {
+          LOG_ERR("KLC", "Failed to persist Kindle total locations");
+        }
+        requestUpdate();
+      });
+}
+
 void EpubReaderActivity::openKindleLocationFlow() {
   if (!epub) {
     return;
   }
 
   if (!KindleLocation::isValidTotal(kindleTotalLocations)) {
-    startActivityForResult(
-        std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_SET_KINDLE_TOTAL), "", 7),
-        [this](const ActivityResult& result) {
-          if (result.isCancelled) {
-            requestUpdate();
-            return;
-          }
-
-          const auto& text = std::get<KeyboardResult>(result.data).text;
-          uint32_t total = 0;
-          if (!parseUnsignedInput(text, total) || !KindleLocation::isValidTotal(total)) {
-            requestUpdate();
-            return;
-          }
-
-          kindleTotalLocations = total;
-          if (!saveKindleLocationTotal(total)) {
-            LOG_ERR("KLC", "Failed to persist Kindle total locations");
-          }
-          requestUpdate();
-        });
+    openKindleTotalFlow();
     return;
   }
 
@@ -768,6 +780,10 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
     }
     case EpubReaderMenuActivity::MenuAction::KINDLE_LOCATION: {
       openKindleLocationFlow();
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::EDIT_KINDLE_TOTAL: {
+      openKindleTotalFlow();
       break;
     }
     case EpubReaderMenuActivity::MenuAction::DISPLAY_QR: {
