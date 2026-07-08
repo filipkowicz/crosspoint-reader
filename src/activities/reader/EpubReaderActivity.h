@@ -3,6 +3,7 @@
 #include <Epub/FootnoteEntry.h>
 #include <Epub/Section.h>
 
+#include <cstdint>
 #include <optional>
 
 #include "BookmarkEntry.h"
@@ -45,6 +46,7 @@ class EpubReaderActivity final : public Activity {
   // Set when the reader is left at end-of-book and SETTINGS.moveFinishedToReadFolder is on.
   // Consumed in onExit() to relocate the finished book into /Read/.
   bool pendingReadFolderMove = false;
+  uint32_t kindleTotalLocations = 0;
 
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
@@ -61,6 +63,13 @@ class EpubReaderActivity final : public Activity {
   void renderStatusBar() const;
   void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
+  void loadKindleLocationTotal();
+  bool saveKindleLocationTotal(uint32_t total);
+  float getCurrentBookProgress() const;
+  uint32_t getCurrentKindleLocation() const;
+  void openKindleTotalFlow();
+  void openKindleLocationFlow();
+  void jumpToProgress(float progress);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.
   void jumpToPercent(int percent);
   void onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action);
