@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 
 #include "CrossPointSettings.h"
@@ -499,7 +500,116 @@ void releaseSdFontCachesForDecode(const GfxRenderer& renderer) {
   }
 }
 
+// Picks the sleep overlay file (same lookup as Current Screen mode), without drawing it.
+bool findSleepOverlayPath(std::string& path) {
+  for (const char* rootPath : {TRANSPARENT_SLEEP_ROOT_BMP, TRANSPARENT_SLEEP_ROOT_PNG}) {
+    if (Storage.exists(rootPath)) {
+      path = rootPath;
+      return true;
+    }
+  }
+  return selectRandomSleepFile(TRANSPARENT_SLEEP_DIR, SleepRecentKind::Overlay, path) ||
+         selectRandomSleepFile(TRANSPARENT_SLEEP_LEGACY_DIR, SleepRecentKind::Overlay, path);
+}
+
 }  // namespace
+
+// A sleep overlay that can be drawn repeatedly into the current render plane, so
+// any sleep screen can be composited under it in every grayscale pass.
+class SleepOverlay {
+ public:
+  bool open(const std::string& overlayPath, const GfxRenderer& renderer) {
+    path = overlayPath;
+    if (FsHelpers::hasPngExtension(path)) {
+      ImageDimensions dimensions;
+      if (!PngToFramebufferConverter::getDimensionsStatic(path, dimensions)) return false;
+      const auto placement = calculateBitmapPlacement(dimensions.width, dimensions.height, renderer);
+      pngConfig.x = placement.x;
+      pngConfig.y = placement.y;
+      pngConfig.maxWidth = renderer.getScreenWidth();
+      pngConfig.maxHeight = renderer.getScreenHeight();
+      pngConfig.useDithering = false;
+      pngConfig.sourceCropX = placement.cropX;
+      pngConfig.sourceCropY = placement.cropY;
+      pngConfig.useExactDimensions = placement.cropX > 0.0f || placement.cropY > 0.0f;
+      pngConfig.preserveAlpha = true;
+      kind = Kind::Png;
+      return true;
+    }
+
+    if (!Storage.openFileForRead("SLP", path, file)) return false;
+    if (parseOverlayBmpHeader(file, bmpInfo, false)) {
+      // Row buffer lives for the whole composite: one allocation reused by all three passes.
+      row = makeUniqueNoThrow<uint8_t[]>(bmpInfo.rowBytes);
+      if (!row) {
+        LOG_ERR("SLP", "OOM: transparent overlay row (%u bytes)", static_cast<unsigned>(bmpInfo.rowBytes));
+        return false;
+      }
+      const auto alphaScanResult = scanForUsefulAlpha(file, bmpInfo, row.get());
+      if (alphaScanResult == AlphaScanResult::Error) return false;
+      if (alphaScanResult == AlphaScanResult::Useful) {
+        bmpPlacement = calculateBitmapPlacement(bmpInfo.width, bmpInfo.height, renderer);
+        kind = Kind::AlphaBmp;
+        return true;
+      }
+      row.reset();
+    }
+
+    bitmap.emplace(file);
+    const auto parseResult = bitmap->parseHeaders();
+    if (parseResult != BmpReaderError::Ok) {
+      LOG_ERR("SLP", "Invalid sleep overlay BMP %s: %s", path.c_str(), Bitmap::errorToString(parseResult));
+      return false;
+    }
+    bmpPlacement = calculateBitmapPlacement(bitmap->getWidth(), bitmap->getHeight(), renderer);
+    kind = Kind::PlainBmp;
+    return true;
+  }
+
+  const std::string& getPath() const { return path; }
+
+  // Draws into whichever plane the renderer is currently set to.
+  bool draw(GfxRenderer& renderer, const TransparentOverlayPass pass) {
+    switch (kind) {
+      case Kind::Png: {
+        PngToFramebufferConverter converter;
+        return converter.decodeToFramebuffer(path, renderer, pngConfig);
+      }
+      case Kind::AlphaBmp:
+        return renderTransparentOverlayPass(file, bmpInfo, bmpPlacement, renderer, row.get(), pass);
+      case Kind::PlainBmp:
+        // drawBitmap with preserveBackground leaves white pixels untouched, so white is transparent.
+        return bitmap->rewindToData() == BmpReaderError::Ok &&
+               renderer.drawBitmap(*bitmap, bmpPlacement.x, bmpPlacement.y, renderer.getScreenWidth(),
+                                   renderer.getScreenHeight(), bmpPlacement.cropX, bmpPlacement.cropY, true);
+    }
+    return false;
+  }
+
+ private:
+  enum class Kind : uint8_t { Png, AlphaBmp, PlainBmp };
+
+  Kind kind = Kind::Png;
+  std::string path;
+  RenderConfig pngConfig{};
+  HalFile file;
+  OverlayBmpInfo bmpInfo;
+  BitmapPlacement bmpPlacement;
+  std::unique_ptr<uint8_t[]> row;
+  std::optional<Bitmap> bitmap;
+};
+
+bool SleepActivity::hasSleepOverlayImage() {
+  if (Storage.exists(TRANSPARENT_SLEEP_ROOT_BMP) || Storage.exists(TRANSPARENT_SLEEP_ROOT_PNG)) return true;
+
+  auto name = makeUniqueNoThrow<char[]>(MAX_SLEEP_FILE_NAME_LEN);
+  if (!name) return false;
+  for (const char* dirPath : {TRANSPARENT_SLEEP_DIR, TRANSPARENT_SLEEP_LEGACY_DIR}) {
+    auto dir = Storage.open(dirPath);
+    if (dir && dir.isDirectory() && findNextValidSleepImage(dir, SleepRecentKind::Overlay, name.get())) return true;
+  }
+  return false;
+}
 
 void SleepActivity::onEnter() {
   Activity::onEnter();
@@ -520,8 +630,8 @@ void SleepActivity::onEnter() {
     return renderLastScreenSleepScreen();
   }
 
-  if (SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::TRANSPARENT_CUSTOM) {
-    // Transparent mode retains the current framebuffer. Materialize any
+  if (SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::CURRENT_SCREEN) {
+    // Current Screen mode retains the current framebuffer. Materialize any
     // output-level inversion first so the retained content keeps its visible
     // polarity after the display driver returns to normal.
     if (frameWasInverted) renderer.invertScreen();
@@ -532,9 +642,25 @@ void SleepActivity::onEnter() {
     if (APP_STATE.lastSleepFromReader) {
       renderer.setOrientation(GfxRenderer::Orientation::Portrait);
     }
-    releaseSdFontCachesForDecode(renderer);
-    return renderTransparentCustomSleepScreen();
+    if (SETTINGS.sleepScreenOverlay) releaseSdFontCachesForDecode(renderer);
+    return renderCurrentScreenSleepScreen();
   }
+
+  // Optional overlay drawn on top of the selected sleep screen. Loaded on the heap only
+  // for the duration of this render: ~0.5 KB of file/Bitmap/PNG state.
+  std::unique_ptr<SleepOverlay> overlayStorage;
+  if (SETTINGS.sleepScreenOverlay) {
+    overlayStorage = makeUniqueNoThrow<SleepOverlay>();
+    std::string overlayPath;
+    if (!overlayStorage) {
+      LOG_ERR("SLP", "OOM: sleep overlay");
+    } else if (findSleepOverlayPath(overlayPath) && overlayStorage->open(overlayPath, renderer)) {
+      overlay = overlayStorage.get();
+    } else {
+      LOG_ERR("SLP", "No valid sleep overlay found, rendering without it");
+    }
+  }
+  ScopedCleanup clearOverlay{[this] { overlay = nullptr; }};
 
   // Show popup with reader orientation only when going to sleep from reader
   if (APP_STATE.lastSleepFromReader) {
@@ -544,6 +670,7 @@ void SleepActivity::onEnter() {
   } else {
     GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
   }
+  if (overlay) releaseSdFontCachesForDecode(renderer);
 
   switch (SETTINGS.sleepScreen) {
     case (CrossPointSettings::SLEEP_SCREEN_MODE::BLANK):
@@ -626,10 +753,14 @@ void SleepActivity::renderDefaultSleepScreen() const {
     renderer.invertScreen();
   }
 
+  if (overlay) return renderWithOverlay(nullptr);
   renderer.displayBuffer(HalDisplay::HALF_REFRESH);
 }
 
 void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap, const bool preserveBackground) const {
+  // Current Screen mode's white-keyed BMP overlays pass preserveBackground; never composite those again.
+  if (overlay && !preserveBackground) return renderWithOverlay(&bitmap);
+
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
   const auto placement = calculateBitmapPlacement(bitmap.getWidth(), bitmap.getHeight(), renderer);
@@ -772,19 +903,23 @@ bool SleepActivity::renderSleepOverlayPath(const std::string& path) const {
   return Storage.openFileForRead("SLP", path, file) && renderSleepOverlayFile(file, path.c_str());
 }
 
-void SleepActivity::renderTransparentCustomSleepScreen() const {
-  if (renderSleepOverlayPath(TRANSPARENT_SLEEP_ROOT_BMP)) return;
-  if (renderSleepOverlayPath(TRANSPARENT_SLEEP_ROOT_PNG)) return;
+void SleepActivity::renderCurrentScreenSleepScreen() const {
+  if (SETTINGS.sleepScreenOverlay) {
+    if (renderSleepOverlayPath(TRANSPARENT_SLEEP_ROOT_BMP)) return;
+    if (renderSleepOverlayPath(TRANSPARENT_SLEEP_ROOT_PNG)) return;
 
-  std::string selectedPath;
-  if (!selectRandomSleepFile(TRANSPARENT_SLEEP_DIR, SleepRecentKind::Overlay, selectedPath)) {
-    selectRandomSleepFile(TRANSPARENT_SLEEP_LEGACY_DIR, SleepRecentKind::Overlay, selectedPath);
+    std::string selectedPath;
+    if (!selectRandomSleepFile(TRANSPARENT_SLEEP_DIR, SleepRecentKind::Overlay, selectedPath)) {
+      selectRandomSleepFile(TRANSPARENT_SLEEP_LEGACY_DIR, SleepRecentKind::Overlay, selectedPath);
+    }
+
+    if (!selectedPath.empty() && renderSleepOverlayPath(selectedPath)) return;
+
+    LOG_ERR("SLP", "No valid sleep overlay found, keeping current screen");
   }
 
-  if (!selectedPath.empty() && renderSleepOverlayPath(selectedPath)) return;
-
-  LOG_ERR("SLP", "No valid transparent sleep overlay found");
-  renderDefaultSleepScreen();
+  // Repaint the retained frame to clear the "Entering sleep" popup from the panel.
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
 }
 
 void SleepActivity::renderCoverSleepScreen() const {
@@ -885,5 +1020,81 @@ void SleepActivity::renderLastScreenSleepScreen() const {
 
 void SleepActivity::renderBlankSleepScreen() const {
   renderer.clearScreen();
+  if (overlay) return renderWithOverlay(nullptr);
   renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+}
+
+// Draws `background` (or keeps the B/W screen already in the framebuffer when null),
+// composites the overlay on top in every render pass and refreshes once.
+void SleepActivity::renderWithOverlay(const Bitmap* background) const {
+  const auto pageWidth = renderer.getScreenWidth();
+  const auto pageHeight = renderer.getScreenHeight();
+  BitmapPlacement placement;
+  if (background) {
+    placement = calculateBitmapPlacement(background->getWidth(), background->getHeight(), renderer);
+    renderer.clearScreen();
+    if (!renderer.drawBitmap(*background, placement.x, placement.y, pageWidth, pageHeight, placement.cropX,
+                             placement.cropY)) {
+      background = nullptr;
+      renderer.clearScreen();
+    } else if (SETTINGS.sleepScreenCoverFilter ==
+               CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::INVERTED_BLACK_AND_WHITE) {
+      renderer.invertScreen();
+    }
+  }
+
+  LOG_DBG("SLP", "Compositing sleep overlay %s", overlay->getPath().c_str());
+  if (!overlay->draw(renderer, TransparentOverlayPass::BW)) {
+    LOG_ERR("SLP", "Failed to draw sleep overlay %s", overlay->getPath().c_str());
+    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+    return;
+  }
+
+  const bool absolute = renderer.grayscaleCapabilities(sleepGrayscaleMode(renderer)).supported();
+  if (absolute) {
+    if (!renderer.displayGrayscaleBase(sleepGrayscaleMode(renderer))) return;
+  } else {
+    renderer.displayGrayscaleBase(HalDisplay::HALF_REFRESH);
+  }
+
+  // Only absolute planes let opaque overlay pixels overwrite the background's gray levels;
+  // overlay-mask planes would leave its gray nudges under the overlay, so the background
+  // stays black and white there.
+  const bool backgroundGray =
+      background && absolute && background->hasGreyscale() &&
+      SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER;
+  bool ready = true;
+  for (const auto plane : {GfxRenderer::GRAYSCALE_LSB, GfxRenderer::GRAYSCALE_MSB}) {
+    if (backgroundGray) {
+      if (background->rewindToData() != BmpReaderError::Ok) {
+        ready = false;
+        break;
+      }
+      renderer.clearScreen(0xFF);
+    } else if (!absolute) {
+      // Absolute planes retain the B/W bits of the base; overlay-mask planes start empty.
+      renderer.clearScreen(0x00);
+    }
+    renderer.setRenderMode(plane);
+    if (backgroundGray && !renderer.drawBitmap(*background, placement.x, placement.y, pageWidth, pageHeight,
+                                               placement.cropX, placement.cropY)) {
+      ready = false;
+      break;
+    }
+    const auto pass = plane == GfxRenderer::GRAYSCALE_LSB ? TransparentOverlayPass::GrayscaleLsb
+                                                          : TransparentOverlayPass::GrayscaleMsb;
+    if (!overlay->draw(renderer, pass)) {
+      ready = false;
+      break;
+    }
+    if (plane == GfxRenderer::GRAYSCALE_LSB)
+      renderer.copyGrayscaleLsbBuffers();
+    else
+      renderer.copyGrayscaleMsbBuffers();
+  }
+  if (ready)
+    renderer.displayGrayBuffer();
+  else
+    LOG_ERR("SLP", "Incomplete grayscale overlay composite; keeping the current display");
+  renderer.setRenderMode(GfxRenderer::BW);
 }
