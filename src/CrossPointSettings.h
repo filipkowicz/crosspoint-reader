@@ -24,7 +24,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     COVER_CUSTOM = 4,
     BLANK = 5,
     QUICK_RESUME = 6,
-    TRANSPARENT_CUSTOM = 7,
+    // Keeps the current screen (was "Transparent" before the overlay became a separate toggle).
+    CURRENT_SCREEN = 7,
     SLEEP_SCREEN_MODE_COUNT
   };
   enum SLEEP_SCREEN_COVER_MODE { FIT = 0, CROP = 1, SLEEP_SCREEN_COVER_MODE_COUNT };
@@ -193,6 +194,10 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   enum READER_MENU_STYLE { READER_MENU_LIST = 0, READER_MENU_TOOLBAR = 1, READER_MENU_STYLE_COUNT };
 
   enum TILT_PAGE_TURN { TILT_OFF = 0, TILT_NORMAL = 1, TILT_NVERTED = 2, TILT_PAGE_TURN_COUNT };
+  enum VIBRATION { VIBRATION_TOUCH = 0, VIBRATION_TOUCH_PAGE = 1, VIBRATION_OFF = 2 };
+  uint8_t vibration = VIBRATION_OFF;
+  enum HAPTIC_INTENSITY { HAPTIC_LOW = 0, HAPTIC_MEDIUM = 1, HAPTIC_HIGH = 2 };
+  uint8_t hapticIntensity = HAPTIC_HIGH;
 
   enum TOUCH_READER_CONTROLS { TOUCH_READER_OFF = 0, TOUCH_READER_ON = 1, TOUCH_READER_CONTROLS_COUNT };
 
@@ -227,6 +232,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t sleepScreenCoverMode = FIT;
   // Sleep screen cover filter
   uint8_t sleepScreenCoverFilter = NO_FILTER;
+  // Draw the transparent sleep overlay on top of the selected sleep screen
+  uint8_t sleepScreenOverlay = 0;
   // Status bar settings
   uint8_t statusBarChapterPageCount = 1;
   uint8_t statusBarBookProgressPercentage = 1;
@@ -255,6 +262,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t clockHasBeenSynced = 0;
   // Text rendering settings
   uint8_t extraParagraphSpacing = 1;
+  uint8_t paragraphIndentSpaces = 2;
   static constexpr uint8_t WORD_SPACING_MIN = 50;
   static constexpr uint8_t WORD_SPACING_MAX = 200;
   static constexpr uint8_t WORD_SPACING_STEP = 25;

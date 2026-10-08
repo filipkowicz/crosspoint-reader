@@ -32,7 +32,10 @@
 #include "SilentRestart.h"
 #include "StatusBarSettingsActivity.h"
 #include "TextSettingsActivity.h"
+#include "activities/boot_sleep/SleepActivity.h"
 #include "activities/network/WifiSelectionActivity.h"
+#include "activities/plugins/PluginCatalogActivity.h"
+#include "activities/util/ConfirmationActivity.h"
 #include "activities/util/IntervalSelectionActivity.h"
 #include "components/UITheme.h"
 #include "components/UIThemeTokens.h"
@@ -66,6 +69,11 @@ void SettingsActivity::rebuildSettingsLists() {
       // not apply on the X4 Pro / X4 Classic (plain OTP waveform, same panels).
       if (setting.valuePtr == &CrossPointSettings::fadingFix &&
           (BoardConfig::isX4Pro() || BoardConfig::isX4Classic())) {
+        continue;
+      }
+      // Quick resume keeps the page with its moon icon; the overlay is not drawn there.
+      if (setting.valuePtr == &CrossPointSettings::sleepScreenOverlay &&
+          SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME) {
         continue;
       }
       displaySettings.push_back(setting);
@@ -108,6 +116,7 @@ void SettingsActivity::rebuildSettingsLists() {
   // asset isn't published yet just report no update available.
   systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_PLUGINS, SettingAction::Plugins));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_KEYBOARD_LAYOUTS, SettingAction::KeyboardLayouts));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_ABOUT, SettingAction::About));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_LANGUAGE, SettingAction::Language));
@@ -287,6 +296,22 @@ void SettingsActivity::toggleCurrentSetting() {
     return;
   }
 
+  if (setting.valuePtr == &CrossPointSettings::sleepScreenOverlay && !SETTINGS.sleepScreenOverlay &&
+      !SleepActivity::hasSleepOverlayImage()) {
+    // Turning the overlay on without an image would silently do nothing: ask first.
+    startActivityForResult(std::make_unique<ConfirmationActivity>(renderer, mappedInput, tr(STR_SLEEP_OVERLAY_MISSING),
+                                                                  tr(STR_SLEEP_OVERLAY_MISSING_HINT)),
+                           [this](const ActivityResult& result) {
+                             if (!result.isCancelled) {
+                               SETTINGS.sleepScreenOverlay = 1;
+                               SETTINGS.saveToFile();
+                               rebuildSettingsLists();
+                             }
+                             requestUpdate();
+                           });
+    return;
+  }
+
   if (setting.type == SettingType::TOGGLE && setting.valuePtr != nullptr) {
     // Toggle the boolean value using the member pointer
     const bool currentValue = SETTINGS.*(setting.valuePtr);
@@ -428,6 +453,9 @@ void SettingsActivity::toggleCurrentSetting() {
                                  rebuildSettingsLists();
                                });
         break;
+      case SettingAction::Plugins:
+        startActivityForResult(std::make_unique<PluginCatalogActivity>(renderer, mappedInput), resultHandler);
+        break;
       case SettingAction::KeyboardLayouts:
         if (auto activity = makeUniqueNoThrow<KeyboardLayoutsActivity>(renderer, mappedInput)) {
           startActivityForResult(std::move(activity), nullptr);
@@ -498,9 +526,6 @@ void SettingsActivity::openSleepTimeoutPicker() {
 
 std::string SettingsActivity::settingValueText(const SettingInfo& setting) {
   if (setting.action == SettingAction::HomeButton) return tr(STR_CONFIGURE);
-  if (setting.type == SettingType::TOGGLE && setting.valuePtr != nullptr) {
-    return SETTINGS.*(setting.valuePtr) ? tr(STR_STATE_ON) : tr(STR_STATE_OFF);
-  }
   if (setting.type == SettingType::ENUM && setting.valuePtr != nullptr) {
     // Guard like the valueGetter branch below: a corrupt/migrated settings
     // byte must not index past the enum table.
@@ -550,8 +575,19 @@ void SettingsActivity::buildScreen(UiScreen& screen) {
   // render.
   const auto& settings = *currentSettings;
   for (size_t i = 0; i < settings.size(); i++) {
-    rowValues_[i] = settingValueText(settings[i]);
-    rowItems_[i].value = rowValues_[i].empty() ? nullptr : rowValues_[i].c_str();
+    const auto& setting = settings[i];
+    const auto labels = setting.enumLabels();
+    const bool checkbox = setting.type == SettingType::TOGGLE ||
+                          (setting.type == SettingType::ENUM && setting.enumStringValues.empty() &&
+                           labels.size() == 2 && labels[0] == StrId::STR_STATE_OFF && labels[1] == StrId::STR_STATE_ON);
+    if (checkbox && (setting.valuePtr || setting.valueGetter)) {
+      const bool checked = setting.valuePtr ? SETTINGS.*(setting.valuePtr) != 0 : setting.valueGetter() != 0;
+      rowValues_[i].clear();
+      GUI.setCheckboxRow(rowItems_[i], checked);
+    } else {
+      rowValues_[i] = settingValueText(setting);
+      rowItems_[i].value = rowValues_[i].empty() ? nullptr : rowValues_[i].c_str();
+    }
   }
 
   fui::ListProps props;
